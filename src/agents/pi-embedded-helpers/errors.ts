@@ -669,7 +669,9 @@ function isOpenRouterKeyLimitExceededError(raw: string, provider?: string): bool
 }
 
 function isExactUnknownNoDetailsError(raw: string): boolean {
-  return normalizeOptionalLowercaseString(raw)?.trim() === "unknown error (no error details in response)";
+  return (
+    normalizeOptionalLowercaseString(raw)?.trim() === "unknown error (no error details in response)"
+  );
 }
 
 function classifyFailoverClassificationFromMessage(
@@ -1109,6 +1111,7 @@ function isCliSessionExpiredErrorMessage(raw: string): boolean {
     lower.includes("session expired") ||
     lower.includes("session invalid") ||
     lower.includes("conversation not found") ||
+    lower.includes("no conversation found") ||
     lower.includes("conversation does not exist") ||
     lower.includes("conversation expired") ||
     lower.includes("conversation invalid") ||
