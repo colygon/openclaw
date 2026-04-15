@@ -59,6 +59,23 @@ type ExecDockerRawFn = (
 type CodeSafetySummaryCache = Map<string, Promise<unknown>>;
 const MAX_WORKSPACE_SKILL_SCAN_FILES_PER_WORKSPACE = 2_000;
 const MAX_WORKSPACE_SKILL_ESCAPE_DETAIL_ROWS = 12;
+
+/**
+ * Resolves the realpath of `p` with a 2 s timeout.
+ *
+ * Returns the realpath string on success, or `null` if realpath fails or the
+ * timeout fires first. Note: fs.realpath cannot be cancelled once submitted to
+ * libuv — the underlying OS call continues running in the background after the
+ * timeout resolves. Callers make sequential (not concurrent) calls so at most
+ * one libuv thread is occupied at a time; the OS will eventually time out the
+ * stuck NFS/SMB call independently.
+ */
+function realpathWithTimeout(p: string, timeoutMs = 2000): Promise<string | null> {
+  return Promise.race([
+    fs.realpath(p).catch(() => null),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+  ]);
+}
 let skillsModulePromise: Promise<typeof import("../agents/skills.js")> | undefined;
 let configModulePromise: Promise<typeof import("../config/config.js")> | undefined;
 
@@ -400,16 +417,19 @@ async function listWorkspaceSkillMarkdownFiles(workspaceDir: string): Promise<st
   const skillFiles: string[] = [];
   const queue: string[] = [skillsRoot];
   const visitedDirs = new Set<string>();
-  const MAX_SYMLINK_DEPTH = 20;
-  let depthGuard = 0;
+  // Caps total BFS dequeues, not per-path depth. Named to reflect actual semantics.
+  const MAX_TOTAL_DIR_VISITS = MAX_WORKSPACE_SKILL_SCAN_FILES_PER_WORKSPACE * 20;
+  let totalDirVisits = 0;
 
   while (
     queue.length > 0 &&
     skillFiles.length < MAX_WORKSPACE_SKILL_SCAN_FILES_PER_WORKSPACE &&
-    depthGuard++ < MAX_SYMLINK_DEPTH * MAX_WORKSPACE_SKILL_SCAN_FILES_PER_WORKSPACE
+    totalDirVisits++ < MAX_TOTAL_DIR_VISITS
   ) {
     const dir = queue.shift()!;
-    const dirRealPath = await fs.realpath(dir).catch(() => path.resolve(dir));
+    // Use the module-level realpathWithTimeout so a hanging network FS doesn't
+    // block the BFS indefinitely (same 2 s guard as the outer escape-detection loop).
+    const dirRealPath = (await realpathWithTimeout(dir)) ?? path.resolve(dir);
     if (visitedDirs.has(dirRealPath)) {
       continue;
     }
@@ -651,12 +671,17 @@ export async function collectPluginsTrustFindings(params: {
       // Warn about allowlist entries that don't match any installed plugin ID.
       // An attacker could register a plugin with an allowlisted ID after the
       // allowlist was created, exploiting the pre-approved entry.
+      // Exclude bundled channel plugin IDs (telegram, discord, etc.) from the
+      // phantom check — they are never in the extensions directory but are
+      // legitimate allowlist targets.
       const installedPluginIds = new Set(pluginDirs.map((dir) => path.basename(dir).toLowerCase()));
+      const bundledPluginIds = new Set(listChannelPlugins().map((p) => p.id.toLowerCase()));
       const phantomEntries = allow.filter(
         (entry) =>
           typeof entry === "string" &&
           entry !== "group:plugins" &&
-          !installedPluginIds.has(entry.toLowerCase()),
+          !installedPluginIds.has(entry.toLowerCase()) &&
+          !bundledPluginIds.has(entry.toLowerCase()),
       );
       if (phantomEntries.length > 0) {
         findings.push({
@@ -925,12 +950,6 @@ export async function collectWorkspaceSkillSymlinkEscapeFindings(params: {
     skillRealPath: string;
   }> = [];
   const seenSkillPaths = new Set<string>();
-
-  const realpathWithTimeout = (p: string, timeoutMs = 2000): Promise<string | null> =>
-    Promise.race([
-      fs.realpath(p).catch(() => null),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
-    ]);
 
   for (const workspaceDir of workspaceDirs) {
     const workspacePath = path.resolve(workspaceDir);
